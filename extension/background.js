@@ -122,6 +122,20 @@ async function dispatch(method, params) {
       return await getPageText(params);
     case "click":
       return await click(params);
+    case "double_click":
+      return await doubleClick(params);
+    case "hover":
+      return await hover(params);
+    case "drag":
+      return await drag(params);
+    case "get_html":
+      return await getHtml(params);
+    case "query_all":
+      return await queryAll(params);
+    case "eval":
+      return await evalExpression(params);
+    case "get_attribute":
+      return await getAttribute(params);
     case "list_elements":
       return await listElements(params);
     case "wait_for_element":
@@ -142,6 +156,8 @@ async function dispatch(method, params) {
       return await activateTab(params);
     case "get_console_logs":
       return await getConsoleLogs(params);
+    case "get_network_requests":
+      return await getNetworkRequests(params);
     case "reload_extension":
       return await reloadExtension();
     case "close_tab":
@@ -149,6 +165,34 @@ async function dispatch(method, params) {
     default:
       throw new Error(`unknown method: ${method}`);
   }
+}
+
+// ensureHelpers injects the shared ISOLATED-world resolver (aglink-inject.js)
+// into a tab right before a selector-based action runs, so every command shares
+// one shadow-DOM-piercing + semantic-locator engine (see aglink-inject.js).
+// It runs in the same isolated world as the action func executeScript issues
+// next, so that func can call globalThis.__aglink.resolve(...). Idempotent —
+// re-injecting just re-defines the global. Injection failures (e.g. a
+// chrome:// page that forbids scripting) are swallowed: the action func falls
+// back to document.querySelector, preserving the old behavior.
+async function ensureHelpers(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["aglink-inject.js"],
+    });
+  } catch (e) {
+    // Non-fatal — see comment above.
+  }
+}
+
+// activeTabId returns params.tabId or the active tab of the focused window,
+// the default-target resolution every selector command shares.
+async function activeTabId(params) {
+  if (params.tabId) return params.tabId;
+  const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!active) throw new Error("no active tab");
+  return active.id;
 }
 
 async function listTabs() {
@@ -209,16 +253,12 @@ async function click(params) {
   if (button !== "left" && button !== "right" && button !== "middle") {
     throw new Error(`click: unknown button ${JSON.stringify(params.button)} (want left/right/middle)`);
   }
-  let tabId = params.tabId;
-  if (!tabId) {
-    const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!active) throw new Error("no active tab");
-    tabId = active.id;
-  }
+  const tabId = await activeTabId(params);
+  await ensureHelpers(tabId);
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func: (sel, btn) => {
-      const el = document.querySelector(sel);
+      const el = globalThis.__aglink ? globalThis.__aglink.resolve(sel) : document.querySelector(sel);
       if (!el) return { found: false };
       el.scrollIntoView({ block: "center", inline: "center" });
       if (btn === "left") {
@@ -244,6 +284,309 @@ async function click(params) {
   const r = results && results[0] && results[0].result;
   if (!r || !r.found) throw new Error(`no element matched selector: ${selector}`);
   return `ok: ${button}-clicked <${r.tag}>${r.text ? " " + JSON.stringify(r.text) : ""}`;
+}
+
+// hover moves the "pointer" onto an element by dispatching the mouseover /
+// mouseenter / mousemove sequence most JS hover menus (dropdowns, tooltips,
+// nav flyouts) listen for. Like right/middle click and keyCombo, these are
+// untrusted (isTrusted:false) synthesized events: a page's OWN JS hover
+// handlers fire, but browser-native :hover-only CSS effects that require a real
+// OS pointer won't. Covers the common case (JS-driven menus) — the whole reason
+// a caller reaches for hover instead of just clicking.
+async function hover(params) {
+  const selector = params.selector;
+  if (!selector) throw new Error("hover requires 'selector'");
+  const tabId = await activeTabId(params);
+  await ensureHelpers(tabId);
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (sel) => {
+      const el = globalThis.__aglink ? globalThis.__aglink.resolve(sel) : document.querySelector(sel);
+      if (!el) return { found: false };
+      el.scrollIntoView({ block: "center", inline: "center" });
+      const rect = el.getBoundingClientRect();
+      const opts = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX: rect.left + rect.width / 2,
+        clientY: rect.top + rect.height / 2,
+      };
+      el.dispatchEvent(new MouseEvent("pointerover", opts));
+      el.dispatchEvent(new MouseEvent("mouseover", opts));
+      el.dispatchEvent(new MouseEvent("mouseenter", { ...opts, bubbles: false }));
+      el.dispatchEvent(new MouseEvent("mousemove", opts));
+      return { found: true, tag: el.tagName.toLowerCase(), text: (el.textContent || "").trim().slice(0, 80) };
+    },
+    args: [selector],
+  });
+  const r = results && results[0] && results[0].result;
+  if (!r || !r.found) throw new Error(`no element matched selector: ${selector}`);
+  return `ok: hovered <${r.tag}>${r.text ? " " + JSON.stringify(r.text) : ""}`;
+}
+
+// doubleClick fires the full mousedown/mouseup/click ×2 + dblclick sequence a
+// page's own JS double-click handlers listen for (renaming a file, opening a
+// row, word-select). Same untrusted-event caveat as click's right/middle path:
+// JS handlers fire, but a browser-native default double-click action tied to
+// trusted input alone won't.
+async function doubleClick(params) {
+  const selector = params.selector;
+  if (!selector) throw new Error("double_click requires 'selector'");
+  const tabId = await activeTabId(params);
+  await ensureHelpers(tabId);
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (sel) => {
+      const el = globalThis.__aglink ? globalThis.__aglink.resolve(sel) : document.querySelector(sel);
+      if (!el) return { found: false };
+      el.scrollIntoView({ block: "center", inline: "center" });
+      const rect = el.getBoundingClientRect();
+      const opts = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX: rect.left + rect.width / 2,
+        clientY: rect.top + rect.height / 2,
+      };
+      for (let i = 0; i < 2; i++) {
+        el.dispatchEvent(new MouseEvent("mousedown", opts));
+        el.dispatchEvent(new MouseEvent("mouseup", opts));
+        el.dispatchEvent(new MouseEvent("click", opts));
+      }
+      el.dispatchEvent(new MouseEvent("dblclick", { ...opts, detail: 2 }));
+      return { found: true, tag: el.tagName.toLowerCase(), text: (el.textContent || "").trim().slice(0, 80) };
+    },
+    args: [selector],
+  });
+  const r = results && results[0] && results[0].result;
+  if (!r || !r.found) throw new Error(`no element matched selector: ${selector}`);
+  return `ok: double-clicked <${r.tag}>${r.text ? " " + JSON.stringify(r.text) : ""}`;
+}
+
+// drag drags a source element onto a target (Playwright dragTo). It fires BOTH
+// a pointer sequence (pointerdown/mousemove/pointerup) and the HTML5 DnD
+// sequence (dragstart/dragenter/dragover/drop/dragend) sharing one DataTransfer,
+// so both JS-driven reorder handlers (sortable lists, kanban boards, which
+// usually listen for pointer/mouse events) and native draggable="true" drop
+// zones (which need the DnD events + dataTransfer) respond. Untrusted events, so
+// JS handlers fire but a browser-native OS drag won't — same category as the
+// other synthesized pointer tools.
+async function drag(params) {
+  const selector = params.selector;
+  const target = params.target;
+  if (!selector) throw new Error("drag requires 'selector' (the source)");
+  if (!target) throw new Error("drag requires 'target' (the destination)");
+  const tabId = await activeTabId(params);
+  await ensureHelpers(tabId);
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (srcSel, dstSel) => {
+      const resolve = (s) => (globalThis.__aglink ? globalThis.__aglink.resolve(s) : document.querySelector(s));
+      const src = resolve(srcSel);
+      if (!src) return { found: false, which: "source", sel: srcSel };
+      const dst = resolve(dstSel);
+      if (!dst) return { found: false, which: "target", sel: dstSel };
+      src.scrollIntoView({ block: "center", inline: "center" });
+      const sr = src.getBoundingClientRect();
+      const dr = dst.getBoundingClientRect();
+      const at = (r) => ({ clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 });
+      const sp = at(sr);
+      const dp = at(dr);
+      const dt = typeof DataTransfer === "function" ? new DataTransfer() : null;
+      const mouse = (type, el, p) =>
+        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: p.clientX, clientY: p.clientY }));
+      const dnd = (type, el, p) => {
+        let ev;
+        try {
+          ev = new DragEvent(type, { bubbles: true, cancelable: true, view: window, clientX: p.clientX, clientY: p.clientY, dataTransfer: dt });
+        } catch (e) {
+          // Some engines forbid passing dataTransfer to the constructor; fall
+          // back to a MouseEvent with dataTransfer patched on.
+          ev = new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: p.clientX, clientY: p.clientY });
+          if (dt) try { Object.defineProperty(ev, "dataTransfer", { value: dt }); } catch (e2) {}
+        }
+        el.dispatchEvent(ev);
+      };
+      // Pointer/mouse path (JS reorder handlers).
+      mouse("pointerdown", src, sp);
+      mouse("mousedown", src, sp);
+      mouse("mousemove", src, sp);
+      mouse("mousemove", dst, dp);
+      // HTML5 DnD path (native drop zones).
+      dnd("dragstart", src, sp);
+      dnd("dragenter", dst, dp);
+      dnd("dragover", dst, dp);
+      dnd("drop", dst, dp);
+      dnd("dragend", src, dp);
+      // Release the pointer over the target.
+      mouse("mouseup", dst, dp);
+      mouse("pointerup", dst, dp);
+      return { found: true, srcTag: src.tagName.toLowerCase(), dstTag: dst.tagName.toLowerCase() };
+    },
+    args: [selector, target],
+  });
+  const r = results && results[0] && results[0].result;
+  if (!r) throw new Error("drag failed");
+  if (!r.found) throw new Error(`no element matched ${r.which} selector: ${r.sel}`);
+  return `ok: dragged <${r.srcTag}> onto <${r.dstTag}>`;
+}
+
+// getAttribute reads a single attribute (or, for name "text", the element's
+// visible textContent) off the matched element — the read-side counterpart for
+// non-value state get_value can't reach: href on a link, aria-checked/
+// aria-expanded/aria-selected state, disabled, class, a data-* attribute. Use
+// it to confirm a page's own JS toggled state after an interaction.
+async function getAttribute(params) {
+  const selector = params.selector;
+  const name = params.name;
+  if (!selector) throw new Error("get_attribute requires 'selector'");
+  if (!name) throw new Error("get_attribute requires 'name' (an attribute name, or 'text' for textContent)");
+  const tabId = await activeTabId(params);
+  await ensureHelpers(tabId);
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (sel, attr) => {
+      const el = globalThis.__aglink ? globalThis.__aglink.resolve(sel) : document.querySelector(sel);
+      if (!el) return { found: false };
+      const tag = el.tagName.toLowerCase();
+      if (attr === "text") return { found: true, tag, present: true, value: (el.textContent || "").trim() };
+      return { found: true, tag, present: el.hasAttribute(attr), value: el.getAttribute(attr) };
+    },
+    args: [selector, name],
+  });
+  const r = results && results[0] && results[0].result;
+  if (!r || !r.found) throw new Error(`no element matched selector: ${selector}`);
+  if (!r.present) return `${name} = (not present) on <${r.tag}>`;
+  return `${name} = ${JSON.stringify(r.value)}`;
+}
+
+// getHtml returns raw outerHTML — of the whole document (no selector) or of one
+// element's subtree (selector) — for scraping structured markup get_page_text's
+// innerText flattens away (tag structure, attributes, hrefs, hidden nodes). The
+// read-side counterpart to get_page_text for crawling.
+async function getHtml(params) {
+  const tabId = await activeTabId(params);
+  const maxChars = params.maxChars || DEFAULT_MAX_CHARS;
+  const selector = params.selector || null;
+  if (selector) await ensureHelpers(tabId);
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (sel) => {
+      let el;
+      if (sel) {
+        el = globalThis.__aglink ? globalThis.__aglink.resolve(sel) : document.querySelector(sel);
+        if (!el) return { found: false };
+      } else {
+        el = document.documentElement;
+      }
+      return { found: true, html: el.outerHTML || "" };
+    },
+    args: [selector],
+  });
+  const r = results && results[0] && results[0].result;
+  if (!r || !r.found) throw new Error(`no element matched selector: ${selector}`);
+  let html = r.html || "";
+  if (html.length > maxChars) {
+    html = html.slice(0, maxChars) + `\n… [truncated at ${maxChars} chars]`;
+  }
+  return html;
+}
+
+// queryAll extracts a field set from EVERY element matching the selector in one
+// call — the crawling workhorse. Uses the shared resolveAll (semantic locators +
+// shadow piercing, visible-first). With no attrs, links auto-include href so
+// `query_all a[href]` harvests a page's links; pass attrs to pull specific
+// fields (href, data-*, aria-*), or "text" to force the textContent column.
+async function queryAll(params) {
+  const selector = params.selector;
+  if (!selector) throw new Error("query_all requires 'selector'");
+  const tabId = await activeTabId(params);
+  await ensureHelpers(tabId);
+  const max = params.max || 200;
+  const attrs = (params.attrs || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (sel, attrList, maxEls) => {
+      const helper = globalThis.__aglink;
+      const cands = helper ? helper.resolveAll(sel) : Array.from(document.querySelectorAll(sel));
+      const out = [];
+      for (const el of cands) {
+        if (out.length >= maxEls) break;
+        const rec = {
+          tag: el.tagName ? el.tagName.toLowerCase() : "",
+          text: (el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 200),
+          attrs: [],
+        };
+        for (const a of attrList) {
+          if (a === "text") continue; // text is already its own column
+          rec.attrs.push([a, el.getAttribute ? el.getAttribute(a) : null]);
+        }
+        // With no explicit attrs, surface href for links so link-harvesting works
+        // out of the box.
+        if (attrList.length === 0 && el.tagName === "A" && el.getAttribute && el.getAttribute("href") != null) {
+          rec.attrs.push(["href", el.getAttribute("href")]);
+        }
+        out.push(rec);
+      }
+      return out;
+    },
+    args: [selector, attrs, max],
+  });
+  const els = (results && results[0] && results[0].result) || [];
+  if (els.length === 0) return `(no elements matched selector: ${selector})`;
+  return els
+    .map((e, i) => {
+      const attrStr = e.attrs.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(" ");
+      return `${i} | ${e.tag} | ${JSON.stringify(e.text)}${attrStr ? " | " + attrStr : ""}`;
+    })
+    .join("\n");
+}
+
+// evalExpression runs a JS expression in the page's MAIN world (like
+// Playwright's page.evaluate) and returns the JSON-stringified value — the
+// escape hatch for extraction the structured tools don't cover (map over nodes,
+// read page globals/framework stores, compute a derived value). MAIN world so it
+// can see the page's own JS state, not just the DOM. Caveat: a strict page CSP
+// without 'unsafe-eval' blocks the in-page eval and this throws — get_html /
+// query_all / get_page_text still work there.
+async function evalExpression(params) {
+  const expression = params.expression;
+  if (!expression) throw new Error("eval requires 'expression'");
+  const tabId = await activeTabId(params);
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: (expr) => {
+      try {
+        // Indirect eval so the expression evaluates in global scope; supports a
+        // bare expression or an IIFE.
+        const val = (0, eval)(expr);
+        let json;
+        if (val === undefined) {
+          json = "undefined";
+        } else {
+          try {
+            json = JSON.stringify(val, null, 2);
+          } catch (e) {
+            json = String(val); // circular / non-serializable → coerce to string
+          }
+          if (json === undefined) json = String(val); // JSON.stringify(fn) === undefined
+        }
+        return { ok: true, json };
+      } catch (e) {
+        return { ok: false, error: String(e && e.message ? e.message : e) };
+      }
+    },
+    args: [expression],
+  });
+  const r = results && results[0] && results[0].result;
+  if (!r) throw new Error("eval returned no result (the page may block script injection)");
+  if (!r.ok) throw new Error(`eval error: ${r.error}`);
+  return r.json;
 }
 
 // AGLINK_ID_ATTR marks each element listElements returns with a fresh,
@@ -281,20 +624,22 @@ const INTERACTIVE_SELECTOR = [
 // markers a previous call left) since SPA pages re-render their DOM
 // constantly — indices are only valid until the page next changes.
 async function listElements(params) {
-  let tabId = params.tabId;
-  if (!tabId) {
-    const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!active) throw new Error("no active tab");
-    tabId = active.id;
-  }
+  const tabId = await activeTabId(params);
+  await ensureHelpers(tabId);
   const max = params.max || 200;
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func: (selectorList, idAttr, maxEls) => {
-      document.querySelectorAll(`[${idAttr}]`).forEach((el) => el.removeAttribute(idAttr));
+      // Pierce open shadow roots when the helper is present, so web-component
+      // internals (buttons/inputs inside a custom element) are listed too;
+      // fall back to the flat top-document scan otherwise.
+      const helper = globalThis.__aglink;
+      const clearSet = helper ? helper.deepQueryAll(`[${idAttr}]`) : document.querySelectorAll(`[${idAttr}]`);
+      clearSet.forEach((el) => el.removeAttribute(idAttr));
+      const candidates = helper ? helper.deepQueryAll(selectorList) : Array.from(document.querySelectorAll(selectorList));
       const out = [];
       let idx = 0;
-      for (const el of document.querySelectorAll(selectorList)) {
+      for (const el of candidates) {
         if (out.length >= maxEls) break;
         const rect = el.getBoundingClientRect();
         // A non-zero rect is enough to mean "rendered": offsetParent is null
@@ -351,19 +696,15 @@ const WAIT_FOR_ELEMENT_POLL_MS = 150;
 async function waitForElement(params) {
   const selector = params.selector;
   if (!selector) throw new Error("wait_for_element requires 'selector'");
-  let tabId = params.tabId;
-  if (!tabId) {
-    const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!active) throw new Error("no active tab");
-    tabId = active.id;
-  }
+  const tabId = await activeTabId(params);
   const timeoutMs = params.timeoutMs || 8000;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
+    await ensureHelpers(tabId);
     const results = await chrome.scripting.executeScript({
       target: { tabId },
       func: (sel) => {
-        const el = document.querySelector(sel);
+        const el = globalThis.__aglink ? globalThis.__aglink.resolve(sel) : document.querySelector(sel);
         if (!el) return { found: false };
         const rect = el.getBoundingClientRect();
         // See listElements' matching comment: offsetParent is null for
@@ -422,16 +763,12 @@ async function typeText(params) {
   const text = params.text;
   if (!selector) throw new Error("type requires 'selector'");
   if (text === undefined || text === null) throw new Error("type requires 'text'");
-  let tabId = params.tabId;
-  if (!tabId) {
-    const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!active) throw new Error("no active tab");
-    tabId = active.id;
-  }
+  const tabId = await activeTabId(params);
+  await ensureHelpers(tabId);
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func: (sel, value) => {
-      const el = document.querySelector(sel);
+      const el = globalThis.__aglink ? globalThis.__aglink.resolve(sel) : document.querySelector(sel);
       if (!el) return { found: false };
       el.scrollIntoView({ block: "center", inline: "center" });
       el.focus();
@@ -465,16 +802,12 @@ async function typeText(params) {
 async function getValue(params) {
   const selector = params.selector;
   if (!selector) throw new Error("get_value requires 'selector'");
-  let tabId = params.tabId;
-  if (!tabId) {
-    const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!active) throw new Error("no active tab");
-    tabId = active.id;
-  }
+  const tabId = await activeTabId(params);
+  await ensureHelpers(tabId);
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func: (sel) => {
-      const el = document.querySelector(sel);
+      const el = globalThis.__aglink ? globalThis.__aglink.resolve(sel) : document.querySelector(sel);
       if (!el) return { found: false };
       const tag = el.tagName.toLowerCase();
       if (el.isContentEditable) {
@@ -611,17 +944,13 @@ async function scroll(params) {
   const dx = params.dx || 0;
   const dy = params.dy || 0;
   if (dx === 0 && dy === 0) throw new Error("scroll requires a non-zero dx or dy");
-  let tabId = params.tabId;
-  if (!tabId) {
-    const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!active) throw new Error("no active tab");
-    tabId = active.id;
-  }
+  const tabId = await activeTabId(params);
   const selector = params.selector || null;
+  if (selector) await ensureHelpers(tabId);
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func: (sel, dxPx, dyPx) => {
-      const target = sel ? document.querySelector(sel) : null;
+      const target = sel ? (globalThis.__aglink ? globalThis.__aglink.resolve(sel) : document.querySelector(sel)) : null;
       if (sel && !target) return { found: false };
       (target || window).scrollBy({ left: dxPx, top: dyPx, behavior: "instant" });
       return { found: true };
@@ -644,16 +973,12 @@ async function selectOption(params) {
   if (value === undefined && label === undefined) {
     throw new Error("select_option requires 'value' or 'label'");
   }
-  let tabId = params.tabId;
-  if (!tabId) {
-    const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!active) throw new Error("no active tab");
-    tabId = active.id;
-  }
+  const tabId = await activeTabId(params);
+  await ensureHelpers(tabId);
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func: (sel, val, lbl) => {
-      const el = document.querySelector(sel);
+      const el = globalThis.__aglink ? globalThis.__aglink.resolve(sel) : document.querySelector(sel);
       if (!el) return { found: false };
       if (el.tagName !== "SELECT") return { found: true, isSelect: false, tag: el.tagName.toLowerCase() };
       let match = null;
@@ -719,6 +1044,45 @@ async function getConsoleLogs(params) {
   const logs = (results && results[0] && results[0].result) || [];
   if (logs.length === 0) return "(no console messages captured)";
   return logs.map((l) => `[${l.level}] ${l.text}`).join("\n");
+}
+
+// getNetworkRequests reads the buffer network-capture.js maintains on the
+// page's own window (MAIN world — same rationale as getConsoleLogs: an
+// isolated-world script has its own separate window and never sees the
+// page's own fetch/XHR calls). The primary tool for reverse-engineering a web
+// app's own AJAX API — what endpoint a button actually calls, with what
+// payload, and what it returns — which get_page_text/get_html/eval can't see
+// since it never touches the rendered DOM.
+async function getNetworkRequests(params) {
+  let tabId = params.tabId;
+  if (!tabId) {
+    const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!active) throw new Error("no active tab");
+    tabId = active.id;
+  }
+  const max = params.max || 50;
+  const filter = (params.filter || "").toLowerCase();
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: (n, f) => {
+      const all = window.__aglinkNetwork || [];
+      const matched = f ? all.filter((e) => (e.url || "").toLowerCase().includes(f)) : all;
+      return matched.slice(-n);
+    },
+    args: [max, filter],
+  });
+  const entries = (results && results[0] && results[0].result) || [];
+  if (entries.length === 0) return "(no network requests captured)";
+  return entries
+    .map((e, i) => {
+      const parts = [`${i} | ${e.type} | ${e.method} ${e.url}`];
+      parts.push(e.error ? `ERROR: ${e.error}` : `-> ${e.status} (${e.durationMs}ms)`);
+      if (e.requestBody) parts.push(`req=${JSON.stringify(e.requestBody)}`);
+      if (e.responseBody) parts.push(`resp=${JSON.stringify(e.responseBody)}`);
+      return parts.join(" | ");
+    })
+    .join("\n");
 }
 
 // reloadExtension restarts the extension itself (chrome.runtime.reload()) —

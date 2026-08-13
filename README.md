@@ -14,6 +14,56 @@ plan is to do it the same way a human would (navigate to a search engine in
 the real browser and read/screenshot the results), not call a search API, so
 it needs its own design pass rather than a one-line addition like the others.
 
+## 빠른 시작 (일반 MCP 클라이언트)
+
+에이전트가 사용자의 **실제 Chrome**을 조작(탭 목록/이동/텍스트 읽기/클릭/타이핑/스크린샷)하게
+해줍니다. 어떤 MCP 클라이언트(Claude Code CLI, Claude Desktop, Cursor 등)에든 stdio MCP
+서버로 등록해서 씁니다.
+
+1. **바이너리 준비** — [Releases](https://github.com/tyranno/aglink-web/releases)에서
+   `aglink-web.exe`를 받거나, 소스에서 빌드: `go build -o aglink-web.exe .`
+
+2. **Chrome 확장 로드 (최초 1회)**
+   1. `chrome://extensions` → 우측 상단 **개발자 모드** 켜기
+   2. **압축해제된 확장 프로그램을 로드합니다** → 이 저장소의 `extension/` 폴더 선택
+
+   확장은 로컬 데몬(`ws://127.0.0.1:48219`)에 자동으로 연결/재연결됩니다.
+
+3. **MCP 서버로 등록** — `mcp` 인자로 띄우면 stdio MCP 서버가 되고, **로컬 데몬
+   (`aglink-web serve`)이 없으면 자동으로 띄웁니다** — 데몬을 따로 실행할 필요 없음.
+   - **Claude Code CLI**
+     ```powershell
+     claude mcp add web -- "C:\path\to\aglink-web.exe" mcp
+     ```
+   - **Claude Desktop / 일반 MCP 클라이언트** — 설정의 `mcpServers`에 추가:
+     ```json
+     {
+       "mcpServers": {
+         "web": {
+           "command": "C:\\path\\to\\aglink-web.exe",
+           "args": ["mcp"]
+         }
+       }
+     }
+     ```
+
+### 사용법
+등록 후 에이전트에게 자연어로 시키면 됩니다:
+```
+크롬 탭 목록 보여줘
+example.com 열어서 페이지 내용 읽어줘
+검색창에 "날씨" 치고 검색해줘
+```
+
+### MCP 없이 단독 테스트 (선택)
+```powershell
+./aglink-web.exe serve                 # 데몬 기동 (1회, 백그라운드)
+./aglink-web.exe cmd list_tabs         # 열린 탭 확인
+./aglink-web.exe cmd navigate https://example.com
+```
+
+---
+
 ## Why this architecture (and not Native Messaging)
 
 Chrome Native Messaging starts a native host process *when the extension opens a

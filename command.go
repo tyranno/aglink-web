@@ -69,17 +69,69 @@ var commands = []command{
 		},
 	},
 	{
-		name: "click",
-		desc: "Click a DOM element in a Chrome tab, matched by CSS selector (e.g. 'button.submit', '#login', 'a[href=\"/next\"]'). Scrolls the element into view first. 'button' left (default) uses the real .click() method; right/middle synthesize mousedown+mouseup+contextmenu/auxclick instead — these reach a page's own JS context-menu/middle-click handler but will NOT open the browser's native right-click menu (that requires a real OS-trusted event). If 'tabId' is omitted, the active tab of the focused window is used.",
+		name: "get_html",
+		desc: "Extract the raw HTML markup of a Chrome tab (outerHTML), for scraping/crawling structured content that document.body.innerText flattens away — tag structure, attributes, hrefs, data-* fields, hidden markup. Omit 'selector' for the whole document; give a CSS selector or semantic locator (role=/text=/label=/placeholder=/testid=, pierces open Shadow DOM) to get just that element's subtree (e.g. one result card, a <table>). Long output is truncated. Prefer get_page_text when you only need readable text, query_all to pull the same field from many elements at once.",
 		args: []argSpec{
-			{name: "selector", typ: argString, required: true, desc: "CSS selector for the element to click."},
+			{name: "selector", typ: argString, desc: "Optional CSS selector or semantic locator for a subtree. Omit for the whole page's HTML."},
+			{name: "maxChars", typ: argInt, desc: "Optional cap on returned characters (default 20000)."},
+			{name: "tabId", typ: argInt, desc: "Optional tab id (from list_tabs). Omit for the active tab."},
+		},
+	},
+	{
+		name: "query_all",
+		desc: "Scrape MANY elements at once: for every element matching the selector (CSS or semantic locator — pierces open Shadow DOM), return one line with its tag, visible text, and requested attributes. This is the crawling workhorse — pull a whole list of search results, product cards, table rows, or links in a single call instead of looping list_elements/get_attribute per element. With no 'attrs', links auto-include their href (so `query_all a[href]` is a link harvester for building a crawl frontier). Pass 'attrs' as a comma-separated list (e.g. 'href,data-id,aria-label') to pull specific fields; use 'text' in attrs to force the textContent column.",
+		args: []argSpec{
+			{name: "selector", typ: argString, required: true, desc: "CSS selector or semantic locator matching the set of elements to extract."},
+			{name: "attrs", typ: argString, desc: "Optional comma-separated attribute names to pull per element (e.g. 'href,data-id'). Omit to just get tag+text (+href for links)."},
+			{name: "max", typ: argInt, desc: "Maximum number of elements to return (default 200)."},
+			{name: "tabId", typ: argInt, desc: "Optional tab id (from list_tabs). Omit for the active tab."},
+		},
+	},
+	{
+		name: "eval",
+		desc: "Evaluate a JavaScript expression in a Chrome tab's page (MAIN world, like Playwright's page.evaluate) and return the JSON-stringified result — the general escape hatch for crawling/extraction the structured tools don't cover: map over DOM nodes, read page globals (window.__DATA__, framework stores), compute a derived value. Pass either an expression ('document.querySelectorAll(\"h2\").length') or an IIFE ('(()=>{...; return x})()'). Caveat: runs in the page's own JS context, so a strict page Content-Security-Policy without 'unsafe-eval' will block it (throws) — use get_html/query_all/get_page_text on those sites. Non-JSON-serializable results are coerced to a string.",
+		args: []argSpec{
+			{name: "expression", typ: argString, required: true, desc: "JavaScript expression or IIFE to evaluate in the page. Its value (JSON-stringified) is returned."},
+			{name: "tabId", typ: argInt, desc: "Optional tab id (from list_tabs). Omit for the active tab."},
+		},
+	},
+	{
+		name: "click",
+		desc: "Click a DOM element in a Chrome tab. The selector is either a CSS selector (e.g. 'button.submit', '#login', 'a[href=\"/next\"]' — now also pierces open Shadow DOM) OR a semantic locator that targets by accessible role/name/text instead of fragile CSS: role=button, role=button[name=\"Save\"] (name is a substring; quote for exact), text=Login (text=\"Login\" for exact match), label=Email, placeholder=Search, testid=submit. Scrolls the element into view first. 'button' left (default) uses the real .click() method; right/middle synthesize mousedown+mouseup+contextmenu/auxclick instead — these reach a page's own JS context-menu/middle-click handler but will NOT open the browser's native right-click menu (that requires a real OS-trusted event). If 'tabId' is omitted, the active tab of the focused window is used.",
+		args: []argSpec{
+			{name: "selector", typ: argString, required: true, desc: "CSS selector or semantic locator (role=/text=/label=/placeholder=/testid=) for the element to click."},
 			{name: "button", typ: argString, desc: "Mouse button: left (default), right, or middle."},
 			{name: "tabId", typ: argInt, desc: "Optional tab id (from list_tabs). Omit for the active tab."},
 		},
 	},
 	{
+		name: "double_click",
+		desc: "Double-click a DOM element in a Chrome tab, matched by CSS selector or semantic locator (role=/text=/label=/placeholder=/testid=, same as click). Scrolls into view, then fires the full mousedown/mouseup/click ×2 + dblclick sequence a page's own JS double-click handlers listen for (renaming a file, opening a row, selecting a word). Like the other pointer tools these are synthesized (untrusted) events — JS handlers fire, but browser-native default double-click actions tied to trusted input alone won't. If 'tabId' is omitted, the active tab of the focused window is used.",
+		args: []argSpec{
+			{name: "selector", typ: argString, required: true, desc: "CSS selector or semantic locator for the element to double-click."},
+			{name: "tabId", typ: argInt, desc: "Optional tab id (from list_tabs). Omit for the active tab."},
+		},
+	},
+	{
+		name: "hover",
+		desc: "Hover the pointer over an element in a Chrome tab, matched by CSS selector or semantic locator (role=/text=/label=/placeholder=/testid=, same as click). Dispatches mouseover/mouseenter/mousemove so a page's own JS hover menus (dropdowns, tooltips, nav flyouts) open — use this to reveal a menu before clicking an item inside it. Note: these are synthesized (untrusted) events, so JS hover handlers fire but pure CSS :hover effects needing a real OS pointer won't. If 'tabId' is omitted, the active tab of the focused window is used.",
+		args: []argSpec{
+			{name: "selector", typ: argString, required: true, desc: "CSS selector or semantic locator for the element to hover."},
+			{name: "tabId", typ: argInt, desc: "Optional tab id (from list_tabs). Omit for the active tab."},
+		},
+	},
+	{
+		name: "drag",
+		desc: "Drag one element onto another in a Chrome tab (Playwright dragTo equivalent) — both matched by CSS selector or semantic locator (role=/text=/label=/placeholder=/testid=). Synthesizes the pointer sequence (pointerdown/mousemove/pointerup) AND the HTML5 drag-and-drop sequence (dragstart/dragenter/dragover/drop/dragend) with a shared DataTransfer, so both JS-driven reorder handlers (sortable lists, kanban) and native draggable=\"true\" drop zones react. These are synthesized (untrusted) events — JS handlers fire but a browser-native OS drag won't. If 'tabId' is omitted, the active tab of the focused window is used.",
+		args: []argSpec{
+			{name: "selector", typ: argString, required: true, desc: "CSS selector or semantic locator for the element to drag (the source)."},
+			{name: "target", typ: argString, required: true, desc: "CSS selector or semantic locator for the element to drop onto (the destination)."},
+			{name: "tabId", typ: argInt, desc: "Optional tab id (from list_tabs). Omit for the active tab."},
+		},
+	},
+	{
 		name: "list_elements",
-		desc: "List currently visible interactive elements (links, buttons, inputs, ARIA controls) in a Chrome tab as 'index | tag[role] | \"label\" | selector=... | viewport(x,y)' lines. The reported selector (a freshly-assigned unique attribute) is guaranteed to match exactly that element — use it directly with click/type instead of guessing a CSS selector from the page's own classes/attributes, which can silently match the wrong element on complex pages. Re-call after the page changes: indices are reassigned every call. viewport(x,y) is the element's on-screen center in CSS pixels (informational only — not an absolute screen coordinate usable by aglink-screen).",
+		desc: "List currently visible interactive elements (links, buttons, inputs, ARIA controls — now including those inside open Shadow DOM / web components) in a Chrome tab as 'index | tag[role] | \"label\" | selector=... | viewport(x,y)' lines. The reported selector (a freshly-assigned unique attribute) is guaranteed to match exactly that element — use it directly with click/type instead of guessing a CSS selector from the page's own classes/attributes, which can silently match the wrong element on complex pages. Re-call after the page changes: indices are reassigned every call. viewport(x,y) is the element's on-screen center in CSS pixels (informational only — not an absolute screen coordinate usable by aglink-screen).",
 		args: []argSpec{
 			{name: "tabId", typ: argInt, desc: "Optional tab id (from list_tabs). Omit for the active tab."},
 			{name: "max", typ: argInt, desc: "Maximum number of elements to return (default 200)."},
@@ -87,9 +139,9 @@ var commands = []command{
 	},
 	{
 		name: "wait_for_element",
-		desc: "Block until an element matching the CSS selector becomes visible in a Chrome tab, instead of polling list_elements/get_page_text in a manual loop — useful for SPA content that renders after navigation or a click settles. Fails with a timeout error after 'timeoutMs' (default 8000) if it never appears.",
+		desc: "Block until an element matching the selector becomes visible in a Chrome tab, instead of polling list_elements/get_page_text in a manual loop — useful for SPA content that renders after navigation or a click settles. The selector is a CSS selector (pierces open Shadow DOM) or a semantic locator (role=/text=/label=/placeholder=/testid=). Fails with a timeout error after 'timeoutMs' (default 8000) if it never appears.",
 		args: []argSpec{
-			{name: "selector", typ: argString, required: true, desc: "CSS selector to wait for."},
+			{name: "selector", typ: argString, required: true, desc: "CSS selector or semantic locator to wait for."},
 			{name: "tabId", typ: argInt, desc: "Optional tab id (from list_tabs). Omit for the active tab."},
 			{name: "timeoutMs", typ: argInt, desc: "Max time to wait in milliseconds (default 8000)."},
 		},
@@ -104,18 +156,27 @@ var commands = []command{
 	},
 	{
 		name: "type",
-		desc: "Type text into an input, textarea, or contenteditable element in a Chrome tab, matched by CSS selector. Replaces any existing value. Fires input/change events so JS-controlled forms notice. If 'tabId' is omitted, the active tab of the focused window is used. Pair with click to focus a field first if needed.",
+		desc: "Type text into an input, textarea, or contenteditable element in a Chrome tab, matched by CSS selector or semantic locator (role=/text=/label=/placeholder=/testid= — e.g. label=Email or placeholder=Search to target a field by its label). Replaces any existing value. Fires input/change events so JS-controlled forms notice. If 'tabId' is omitted, the active tab of the focused window is used. Pair with click to focus a field first if needed.",
 		args: []argSpec{
-			{name: "selector", typ: argString, required: true, desc: "CSS selector for the input/textarea/contenteditable element."},
+			{name: "selector", typ: argString, required: true, desc: "CSS selector or semantic locator for the input/textarea/contenteditable element."},
 			{name: "text", typ: argString, required: true, desc: "Text to type."},
 			{name: "tabId", typ: argInt, desc: "Optional tab id (from list_tabs). Omit for the active tab."},
 		},
 	},
 	{
 		name: "get_value",
-		desc: "Read an element's CURRENT value/text (input/textarea's .value, or textContent for contenteditable), matched by CSS selector. The read-side counterpart to type/select_option — get_page_text can't see this, since an <input>'s value isn't part of document.body.innerText. Use this to confirm what a field actually holds now after page JS may have rewritten it (autocomplete, a calculated total, reformatting).",
+		desc: "Read an element's CURRENT value/text (input/textarea's .value, or textContent for contenteditable), matched by CSS selector or semantic locator (role=/text=/label=/placeholder=/testid=). The read-side counterpart to type/select_option — get_page_text can't see this, since an <input>'s value isn't part of document.body.innerText. Use this to confirm what a field actually holds now after page JS may have rewritten it (autocomplete, a calculated total, reformatting).",
 		args: []argSpec{
-			{name: "selector", typ: argString, required: true, desc: "CSS selector for the element to read."},
+			{name: "selector", typ: argString, required: true, desc: "CSS selector or semantic locator for the element to read."},
+			{name: "tabId", typ: argInt, desc: "Optional tab id (from list_tabs). Omit for the active tab."},
+		},
+	},
+	{
+		name: "get_attribute",
+		desc: "Read one attribute of an element in a Chrome tab, matched by CSS selector or semantic locator (role=/text=/label=/placeholder=/testid=). Use name='text' to get the element's visible textContent instead of an attribute. The counterpart to get_value for non-value state get_value can't reach — href on a link, aria-checked/aria-expanded/aria-selected, disabled, class, or any data-* attribute — e.g. to confirm a page's JS toggled a control's state after a click. Returns '<name> = <value>', or '<name> = (not present)' if the attribute is absent.",
+		args: []argSpec{
+			{name: "selector", typ: argString, required: true, desc: "CSS selector or semantic locator for the element to read."},
+			{name: "name", typ: argString, required: true, desc: "Attribute name to read (e.g. 'href', 'aria-expanded', 'disabled', 'class', 'data-id'), or 'text' for the element's textContent."},
 			{name: "tabId", typ: argInt, desc: "Optional tab id (from list_tabs). Omit for the active tab."},
 		},
 	},
@@ -160,6 +221,15 @@ var commands = []command{
 		args: []argSpec{
 			{name: "tabId", typ: argInt, desc: "Optional tab id (from list_tabs). Omit for the active tab."},
 			{name: "max", typ: argInt, desc: "Maximum number of recent messages to return (default 50)."},
+		},
+	},
+	{
+		name: "get_network_requests",
+		desc: "Read recent AJAX calls (fetch and XMLHttpRequest) made by the page — method, URL, status, duration, and truncated request/response bodies — captured from a tab since it loaded. The tool for reverse-engineering a web app's own API: what endpoint does clicking a button actually call, with what payload, and what does it return. get_page_text/get_html/eval can't see this, since it never touches the rendered DOM. Binary responses (images, blobs) are recorded without a body preview. Use 'filter' to narrow a busy page down to the one call you care about.",
+		args: []argSpec{
+			{name: "tabId", typ: argInt, desc: "Optional tab id (from list_tabs). Omit for the active tab."},
+			{name: "max", typ: argInt, desc: "Maximum number of recent requests to return (default 50)."},
+			{name: "filter", typ: argString, desc: "Optional case-insensitive substring to filter by URL (e.g. 'approve' or '/api/')."},
 		},
 	},
 	{
