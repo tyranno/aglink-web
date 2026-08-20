@@ -62,10 +62,21 @@ var commands = []command{
 	},
 	{
 		name: "get_page_text",
-		desc: "Extract the visible text (document.body.innerText) of a Chrome tab so it can be read/summarized. If 'tabId' is omitted, the active tab of the focused window is used. Long pages are truncated.",
+		desc: "Extract the visible text (innerText) of a Chrome tab so it can be read/summarized. If 'tabId' is omitted, the active tab of the focused window is used. The reply ALWAYS ends with a '[cursor:N]' line (N = current total text length). To cheaply poll a GROWING page (e.g. a long chat) without re-reading the whole thing each time, pass that N back as 'cursor' on the next call — you then get ONLY the text added since, plus a fresh cursor. 'offset' reads a window from a character position: negative reads from the END (tail), e.g. offset=-5000 returns the last 5000 chars, so you see the newest content without having to keep raising maxChars. 'selector' scopes extraction to a single element (e.g. the conversation container) to exclude sidebars/menus. Output is capped by maxChars.",
 		args: []argSpec{
 			{name: "tabId", typ: argInt, desc: "Optional tab id (from list_tabs). Omit for the active tab."},
 			{name: "maxChars", typ: argInt, desc: "Optional cap on returned characters (default 20000)."},
+			{name: "offset", typ: argInt, desc: "Start character offset. NEGATIVE reads from the END (tail): -5000 = the last 5000 chars (newest content). Default 0 = from the start. Ignored when 'cursor' is set."},
+			{name: "cursor", typ: argInt, desc: "Incremental poll: pass the N from a previous reply's '[cursor:N]' line to return ONLY text added since. Cheapest way to watch a growing page — the reply carries a fresh cursor."},
+			{name: "selector", typ: argString, desc: "Optional CSS selector or semantic locator (role=/text=/label=/placeholder=/testid=, pierces open Shadow DOM) to scope text to ONE element (e.g. the chat container), excluding the rest of the page. Omit for document.body."},
+		},
+	},
+	{
+		name: "element_exists",
+		desc: "Cheaply check whether an element matching the selector is present/visible, returning a tiny JSON ({\"exists\":bool,\"visible\":bool,\"count\":N}) with NO page text — the low-cost way to poll a boolean condition (e.g. is a 'Stop'/working spinner showing, meaning the app is busy?) instead of get_page_text or query_all. The selector is a CSS selector or semantic locator (role=/text=/label=/placeholder=/testid=, pierces open Shadow DOM).",
+		args: []argSpec{
+			{name: "selector", typ: argString, required: true, desc: "CSS selector or semantic locator to test for."},
+			{name: "tabId", typ: argInt, desc: "Optional tab id (from list_tabs). Omit for the active tab."},
 		},
 	},
 	{

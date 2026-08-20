@@ -120,6 +120,8 @@ async function dispatch(method, params) {
       return await navigate(params);
     case "get_page_text":
       return await getPageText(params);
+    case "element_exists":
+      return await elementExists(params);
     case "click":
       return await click(params);
     case "double_click":
@@ -218,22 +220,88 @@ async function navigate(params) {
 }
 
 async function getPageText(params) {
-  let tabId = params.tabId;
-  if (!tabId) {
-    const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!active) throw new Error("no active tab");
-    tabId = active.id;
-  }
+  const tabId = await activeTabId(params);
   const maxChars = params.maxChars || DEFAULT_MAX_CHARS;
+  const selector = params.selector || null;
+  // int-only params (see command.go): cursor>0 = incremental; offset<0 = tail.
+  const hasCursor = Number.isFinite(params.cursor) && params.cursor > 0;
+  const cursor = hasCursor ? Math.floor(params.cursor) : -1;
+  const offset = Number.isFinite(params.offset) ? Math.floor(params.offset) : 0;
+
+  if (selector) await ensureHelpers(tabId);
   const results = await chrome.scripting.executeScript({
     target: { tabId },
-    func: () => document.body ? document.body.innerText : "",
+    func: (sel) => {
+      let el;
+      if (sel) {
+        el = globalThis.__aglink ? globalThis.__aglink.resolve(sel) : document.querySelector(sel);
+        if (!el) return { found: false };
+      } else {
+        el = document.body;
+      }
+      return { found: true, text: el ? (el.innerText || "") : "" };
+    },
+    args: [selector],
   });
-  let text = (results && results[0] && results[0].result) || "";
-  if (text.length > maxChars) {
-    text = text.slice(0, maxChars) + `\n… [truncated at ${maxChars} chars]`;
+  const r = results && results[0] && results[0].result;
+  if (selector && (!r || !r.found)) throw new Error(`no element matched selector: ${selector}`);
+  const full = (r && r.text) || "";
+  const total = full.length;
+
+  // Incremental (cursor) mode: return only what was appended since `cursor`.
+  if (hasCursor) {
+    if (cursor <= total) {
+      let delta = full.slice(cursor);
+      let note = `new:${delta.length}`;
+      if (delta.length > maxChars) { delta = delta.slice(-maxChars); note += ` truncated-to-last:${maxChars}`; }
+      const body = delta.length ? delta : "(no new text since cursor)";
+      return `${body}\n[cursor:${total} ${note}]`;
+    }
+    // The text is now shorter than the cursor — it changed/reset (e.g. a new
+    // conversation loaded). Resync by returning a tail and a fresh cursor.
+    const t = total > maxChars ? full.slice(-maxChars) : full;
+    return `${t}\n[cursor:${total} reset (content shrank; showing last ${t.length})]`;
   }
-  return text;
+
+  // Windowed read: offset<0 reads from the end (tail); otherwise from `offset`.
+  let text, span;
+  if (offset < 0) {
+    const n = Math.min(-offset, maxChars);
+    text = full.slice(-n);
+    span = `${Math.max(0, total - n)}..${total}`;
+  } else {
+    const start = Math.min(offset, total);
+    text = full.slice(start, start + maxChars);
+    span = `${start}..${start + text.length}`;
+  }
+  const trunc = text.length < total ? ` (${span} of ${total})` : "";
+  return `${text}\n[cursor:${total}${trunc}]`;
+}
+
+// elementExists cheaply reports whether a selector matches, with NO page text —
+// the low-cost primitive for polling a boolean condition (e.g. "is the app busy",
+// keyed off a working/stop indicator's presence) instead of get_page_text/query_all.
+async function elementExists(params) {
+  const selector = params.selector;
+  if (!selector) throw new Error("element_exists requires 'selector'");
+  const tabId = await activeTabId(params);
+  await ensureHelpers(tabId);
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (sel) => {
+      const all = globalThis.__aglink ? globalThis.__aglink.resolveAll(sel)
+                                      : Array.from(document.querySelectorAll(sel));
+      let visible = false;
+      for (const el of all) {
+        const rc = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+        if (rc && rc.width > 0 && rc.height > 0) { visible = true; break; }
+      }
+      return { exists: all.length > 0, visible, count: all.length };
+    },
+    args: [selector],
+  });
+  const r = (results && results[0] && results[0].result) || { exists: false, visible: false, count: 0 };
+  return JSON.stringify(r);
 }
 
 // click left-clicks by default via the real .click() DOM method (a trusted
